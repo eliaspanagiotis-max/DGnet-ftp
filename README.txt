@@ -1,4 +1,4 @@
-DGnet FTP Monitor - GREEK NATIONAL v9.999.9.7 - OFFICIAL FINAL
+Deforming Gaia network, University of Patras, Greece, FTP Monitor
 November 10, 2025 03:09 PM EET - Athens, Greece
 
 100% PERFECT FEATURES:
@@ -12,5 +12,3 @@ November 10, 2025 03:09 PM EET - Athens, Greece
 RUN:
 pip install paramiko
 python main.py
-
-ΕΘΝΙΚΟ ΕΡΓΑΛΕΙΟ ΓΕΩΔΑΙΣΙΑΣ - ΑΨΟΓΟ ΚΑΙ ΑΘΑΝΑΤΟ
