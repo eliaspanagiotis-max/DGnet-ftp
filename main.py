@@ -1,9 +1,11 @@
 import argparse
+import atexit
 import logging
 import os
 import signal
 import sys
 import time
+import traceback
 from datetime import datetime, timedelta
 
 from config import setup_logging
@@ -12,19 +14,31 @@ from scheduler_control import CONTROL_FILE, PID_FILE, LOG_FILE, read_control, wr
 
 logger = logging.getLogger(__name__)
 
+_stop_reason = "unknown (process killed or crashed)"
+
+
+def _atexit_log():
+    logger.info("Process exiting. Stop reason: %s", _stop_reason)
+
 
 def run_headless(manager):
     """Run the scheduler as a service. Reads settings from control file."""
+    global _stop_reason
+
     # Write PID file
     with open(PID_FILE, 'w') as f:
         f.write(str(os.getpid()))
 
     def stop(sig, frame):
+        global _stop_reason
+        _stop_reason = f"signal {sig}"
         logger.info("Received signal %s, stopping scheduler service...", sig)
         write_control(False)
 
     signal.signal(signal.SIGINT, stop)
     signal.signal(signal.SIGTERM, stop)
+    if hasattr(signal, 'SIGBREAK'):  # Windows Ctrl+Break / task-manager kill
+        signal.signal(signal.SIGBREAK, stop)
 
     logger.info("Scheduler service started (PID %d)", os.getpid())
 
@@ -32,6 +46,7 @@ def run_headless(manager):
         while True:
             ctrl = read_control()
             if not ctrl or not ctrl.get('running', False):
+                _stop_reason = "control file set running=false"
                 logger.info("Control file says stop. Exiting.")
                 break
 
@@ -50,6 +65,7 @@ def run_headless(manager):
             while datetime.now() < next_run:
                 ctrl = read_control()
                 if not ctrl or not ctrl.get('running', False):
+                    _stop_reason = "control file set running=false (during wait)"
                     logger.info("Control file says stop. Exiting.")
                     return
                 # Re-read delay in case GUI changed it
@@ -65,27 +81,36 @@ def run_headless(manager):
 
             # Scan
             logger.info("Starting scan...")
-            log = manager.scan_all(
-                days_back,
-                progress_cb=lambda msg: logger.info(msg),
-                file_cb=lambda site, f: logger.debug("[%s] %s", site, f),
-            )
-            manager.auto_download_completed(log, delay_minutes)
+            try:
+                log = manager.scan_all(
+                    days_back,
+                    progress_cb=lambda msg: logger.info(msg),
+                    file_cb=lambda site, f: logger.debug("[%s] %s", site, f),
+                )
+                manager.auto_download_completed(log, delay_minutes)
 
-            total = sum(len(items) for items in log.log.values())
-            missing = sum(
-                1 for items in log.log.values()
-                for item in items
-                if item['status'] in ('missing locally', 'size mismatch')
-            )
-            logger.info("Scan complete: %d files checked, %d missing/mismatched", total, missing)
+                total = sum(len(items) for items in log.log.values())
+                missing = sum(
+                    1 for items in log.log.values()
+                    for item in items
+                    if item['status'] in ('missing locally', 'size mismatch')
+                )
+                logger.info("Scan complete: %d files checked, %d missing/mismatched", total, missing)
+            except Exception:
+                logger.error("Unhandled exception during scan:\n%s", traceback.format_exc())
+                raise
+
+    except Exception:
+        _stop_reason = "unhandled exception (see ERROR above)"
+        logger.critical("Scheduler crashed with unhandled exception:\n%s", traceback.format_exc())
+        raise
     finally:
         # Cleanup PID file
         try:
             os.remove(PID_FILE)
         except OSError:
             pass
-        logger.info("Scheduler service stopped.")
+        logger.info("Scheduler service stopped. Reason: %s", _stop_reason)
 
 
 if __name__ == "__main__":
@@ -104,6 +129,7 @@ if __name__ == "__main__":
         file_handler.setFormatter(logging.Formatter('%(asctime)s [%(levelname)s] %(name)s: %(message)s',
                                                      datefmt='%Y-%m-%d %H:%M:%S'))
         logging.getLogger().addHandler(file_handler)
+        atexit.register(_atexit_log)
         run_headless(manager)
     else:
         from gui import FTPSiteGUI
