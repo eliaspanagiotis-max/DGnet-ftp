@@ -1,0 +1,38 @@
+[
+  {
+    "name": "SITE1",
+    "host": "192.168.1.1",
+    "protocol": "ftp",
+    "port": 21,
+    "user": "username",
+    "password": "password",
+    "path": "/path/to/files",
+    "pattern": "SITE1%m%d%H.tps",
+    "frequency": "hourly",
+    "network": "NETWORK",
+    "rate": "1s",
+    "external_clock": false,
+    "use_letter_hour": true,
+    "output_dir": "./downloads/SITE1/%Y/%m",
+    "station_code": "SIT1",
+    "format": "Topcon"
+  },
+  {
+    "name": "SITE2",
+    "host": "192.168.1.2",
+    "protocol": "sftp",
+    "port": 22,
+    "user": "username",
+    "password": "password",
+    "path": "/%Y%m/%d/",
+    "pattern": "SITE220%y%m%d%H00a.T00",
+    "frequency": "hourly",
+    "network": "NETWORK",
+    "rate": "10Hz",
+    "external_clock": false,
+    "use_letter_hour": false,
+    "output_dir": "./downloads/SITE2",
+    "station_code": "SIT2",
+    "format": "Trimble"
+  }
+]
