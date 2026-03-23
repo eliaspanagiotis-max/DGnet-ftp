@@ -1,12 +1,20 @@
-import tkinter as tk
-from tkinter import ttk, messagebox, scrolledtext
-import threading
-import time
+import copy
+import logging
 import os
 import re
+import subprocess
+import sys
+import threading
+import time
+import tkinter as tk
 from datetime import datetime, timedelta, timezone
+from tkinter import ttk, messagebox, scrolledtext
+
+from scheduler_control import PID_FILE, read_control, write_control, is_service_running
 from manager import FTPSiteManager
 from models import MissingFilesLog
+
+logger = logging.getLogger(__name__)
 
 def extract_station_name(filename):
     match = re.search(r'([A-Z]{4}\d{2}[A-Z])', filename.upper())
@@ -27,6 +35,7 @@ class FTPSiteGUI:
         self.root.geometry("1950x1080")
         self.root.minsize(1700, 950)
         self.days_var = tk.IntVar(value=1)
+        self.all_remote_var = tk.BooleanVar(value=False)
         self.summary_days_var = tk.IntVar(value=7)
         self.show_issues = tk.BooleanVar(value=True)
         self.filter_site = tk.StringVar(value="All Stations")
@@ -40,8 +49,28 @@ class FTPSiteGUI:
         self.scheduler_thread = None
         self.next_run_time = None
         self.missing_text = None
+        self._missing_by_iid = {}
         self._build_ui()
         self._refresh_sites()
+        self._check_service_on_start()
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    def _check_service_on_start(self):
+        """If the scheduler service is already running, sync the GUI state."""
+        if is_service_running():
+            ctrl = read_control()
+            if ctrl and ctrl.get('running', False):
+                self.scheduler_running = True
+                self.delay_minutes.set(ctrl.get('delay', 15))
+                self.days_var.set(ctrl.get('days', 1))
+                self.scheduler_btn.config(text="STOP SCHEDULER")
+                self.led.delete("dot")
+                self.led.create_oval(4, 4, 14, 14, fill="lime", outline="green", width=3, tags="dot")
+                self._schedule_next_run()
+                self.scheduler_thread = threading.Thread(
+                    target=self._scheduler_loop, args=(False,), daemon=True)
+                self.scheduler_thread.start()
+                logger.info("Detected running scheduler service (PID in %s)", PID_FILE)
 
     def _build_ui(self):
         paned = ttk.PanedWindow(self.root, orient=tk.HORIZONTAL)
@@ -78,7 +107,10 @@ class FTPSiteGUI:
 
         row1 = ttk.Frame(ctrl); row1.pack(fill='x', pady=6)
         ttk.Label(row1, text="Days:").pack(side=tk.LEFT, padx=5)
-        ttk.Spinbox(row1, from_=1, to=30, textvariable=self.days_var, width=5, command=self._refresh_table).pack(side=tk.LEFT, padx=5)
+        self.days_spin = ttk.Spinbox(row1, from_=1, to=365, textvariable=self.days_var, width=5, command=self._refresh_table)
+        self.days_spin.pack(side=tk.LEFT, padx=5)
+        ttk.Checkbutton(row1, text="All available (remote)", variable=self.all_remote_var,
+                        command=self._on_all_remote_toggle).pack(side=tk.LEFT, padx=8)
         ttk.Checkbutton(row1, text="Issues only", variable=self.show_issues, command=self._filter_only).pack(side=tk.LEFT, padx=20)
         ttk.Label(row1, text="Station:").pack(side=tk.LEFT, padx=10)
         self.combo = ttk.Combobox(row1, textvariable=self.filter_site, state='readonly', width=30)
@@ -99,7 +131,7 @@ class FTPSiteGUI:
         ttk.Label(row2, text="Minutes after hour:").pack(side=tk.LEFT, padx=8)
         ttk.Spinbox(row2, from_=1, to=59, textvariable=self.delay_minutes, width=5).pack(side=tk.LEFT, padx=5)
 
-        ttk.Label(ctrl, textvariable=self.scheduler_var, foreground="#006400", font=('Segoe UI', 10, 'bold')).pack(pady=4)
+        ttk.Label(ctrl, textvariable=self.scheduler_var, foreground="#006400", font=('Segoe UI', 10, 'bold'), anchor='w').pack(fill='x', padx=15, pady=4)
         self.progress = ttk.Progressbar(ctrl, mode='determinate')
         self.progress.pack(fill='x', padx=15, pady=8)
 
@@ -125,6 +157,7 @@ class FTPSiteGUI:
         self.tree.tag_configure('mismatch', background='#ff9999', foreground='darkred')
         self.tree.tag_configure('scheduled', background='#ccffcc', foreground='green')
         self.tree.tag_configure('current_growing', background='#e6f3ff', foreground='blue', font=('Segoe UI', 9, 'bold'))
+        self.tree.tag_configure('conn_failed', background='#e0e0e0', foreground='#666666')
 
         # TAB 2: Network Summary
         tab2 = ttk.Frame(self.notebook)
@@ -175,7 +208,11 @@ class FTPSiteGUI:
 
         status_frame = ttk.Frame(self.root)
         status_frame.pack(fill='x', side='bottom')
-        ttk.Label(status_frame, textvariable=self.status_var, relief='sunken', anchor='w', padding=10, font=('Segoe UI', 10)).pack(fill='x')
+        self.status_text = tk.Text(status_frame, height=2, font=('Segoe UI', 10),
+                                   relief='sunken', state='disabled', wrap='word',
+                                   bg='#f0f0f0', padx=10, pady=5, bd=1)
+        self.status_text.pack(fill='x')
+        self.status_var.trace_add('write', self._update_status_display)
 
         style = ttk.Style()
         style.configure("Accent.TButton", foreground="white", background="#0066cc", font=('Segoe UI', 10, 'bold'))
@@ -190,10 +227,7 @@ class FTPSiteGUI:
         item = self.summary_tree.item(sel[0])
         values = item['values']
         group = values[0]
-        try:
-            missing_files = values[4]
-        except:
-            missing_files = []
+        missing_files = self._missing_by_iid.get(sel[0], [])
         if not missing_files:
             self.missing_text.insert(tk.END, f"PERFECT! NO MISSING FILES\n\n{group}\n\nAll files present and correct!")
             return
@@ -238,16 +272,18 @@ class FTPSiteGUI:
                         mtime = os.path.getmtime(item['local_path'])
                         file_dt = datetime.fromtimestamp(mtime, tz=timezone.utc)
                         item['file_dt'] = file_dt
-                    except: pass
+                    except OSError:
+                        pass
                 
                 if file_dt and (groups[group_key]['last_dt'] is None or file_dt > groups[group_key]['last_dt']):
                     groups[group_key]['last_dt'] = file_dt
                     groups[group_key]['last_file'] = item['file']
-                
-                if item['status'] in ['missing locally', 'missing remotely', 'size mismatch'] and not item.get('is_current_utc', False):
+
+                if item['status'] in ('missing locally', 'missing remotely', 'size mismatch') and not item.get('is_current_utc', False):
                     if file_dt is None or file_dt >= cutoff:
                         groups[group_key]['missing'].append(item['file'])
 
+        self._missing_by_iid.clear()
         for group, data in sorted(groups.items()):
             last_str = data['last_dt'].strftime("%Y-%m-%d %H:%M UTC") if data['last_dt'] else "Never"
             missing_files = data['missing']
@@ -256,7 +292,7 @@ class FTPSiteGUI:
             iid = self.summary_tree.insert('', 'end', values=(
                 group, last_str, data['last_file'] or "—", missing_count
             ), tags=(tag,))
-            self.summary_tree.item(iid, values=(group, last_str, data['last_file'] or "—", missing_count, missing_files))
+            self._missing_by_iid[iid] = missing_files
 
         total_missing = sum(len(g['missing']) for g in groups.values())
         filter_text = f" (filtered: {target_log})" if target_log else ""
@@ -276,18 +312,80 @@ class FTPSiteGUI:
             self._refresh_table()
             self._refresh_summary()
 
+    def _insert_site_items(self, site_items):
+        now_utc = datetime.now(timezone.utc)
+        for item in site_items:
+            if self.show_issues.get() and item['status'] in ['ok', 'scheduled'] and not item.get('is_current_utc'):
+                continue
+            if self.filter_site.get() != "All Stations" and item['site'] != self.filter_site.get():
+                continue
+
+            view_item = copy.copy(item)
+            if 'file_dt' not in view_item:
+                try:
+                    if ' ' in view_item['date']:
+                        view_item['file_dt'] = datetime.strptime(view_item['date'], "%Y-%m-%d %H:%M").replace(tzinfo=timezone.utc)
+                    else:
+                        view_item['file_dt'] = datetime.strptime(view_item['date'], "%Y-%m-%d").replace(tzinfo=timezone.utc)
+                except ValueError:
+                    view_item['file_dt'] = None
+
+            is_current_utc = (' ' in view_item['date']
+                and view_item['date'].split()[0] == now_utc.strftime("%Y-%m-%d")
+                and view_item['date'].split()[1][:2] == now_utc.strftime("%H"))
+            if is_current_utc and view_item['remote'] == 'yes':
+                view_item['is_current_utc'] = True
+                view_item['status'] = 'new'
+
+            tag = ('current_growing' if view_item.get('is_current_utc') else
+                   'conn_failed' if view_item['status'] in ('connection failed', 'ok (offline)') else
+                   'missing_local' if view_item['status'] == 'missing locally' else
+                   'missing_remote' if view_item['status'] == 'missing remotely' else
+                   'mismatch' if view_item['status'] == 'size mismatch' else 'scheduled')
+
+            log_name = view_item['site']
+            station_name = getattr(view_item['site_obj'], 'station_code', extract_station_name(view_item['file']))
+            local_size_str = format_size(view_item['local_size']) if view_item['local'] == 'yes' else "\u2014"
+            remote_size_str = format_size(view_item['remote_size']) if view_item['remote'] == 'yes' else "\u2014"
+
+            self.tree.insert('', 'end', values=(
+                log_name, station_name, view_item['date'], view_item['file'],
+                view_item['local'], local_size_str,
+                view_item['remote'], remote_size_str,
+                view_item['status'],
+                'CURRENT (growing)' if view_item.get('is_current_utc') else 'Future' if view_item['future'] else 'Past'
+            ), tags=(tag,))
+
+    def _on_all_remote_toggle(self):
+        self.days_spin.config(state='disabled' if self.all_remote_var.get() else 'normal')
+
     def _scan_and_download(self, auto=False):
         for i in self.tree.get_children(): self.tree.delete(i)
-        self.status_var.set("Scanning Greek network...")
         self.scan_btn.config(state='disabled')
 
+        def on_site_done(site_name, items):
+            self.root.after(0, lambda: self._insert_site_items(items))
+
+        def on_file(site_name, fname):
+            self.root.after(0, lambda: self.status_var.set(f"[{site_name}] {fname}"))
+
         def task():
-            log = self.manager.scan_all(self.days_var.get(),
-                lambda msg: self.root.after(0, lambda: self.status_var.set(msg)))
+            if self.all_remote_var.get():
+                self.root.after(0, lambda: self.status_var.set("Scanning ALL remote files (this may take a while)..."))
+                log = self.manager.scan_all_remote(
+                    progress_cb=lambda msg: self.root.after(0, lambda: self.status_var.set(msg)),
+                    site_cb=on_site_done,
+                    file_cb=on_file)
+            else:
+                self.root.after(0, lambda: self.status_var.set("Scanning Greek network..."))
+                log = self.manager.scan_all(
+                    self.days_var.get(),
+                    progress_cb=lambda msg: self.root.after(0, lambda: self.status_var.set(msg)),
+                    site_cb=on_site_done,
+                    file_cb=on_file)
             self.full_log = log
             self.root.after(0, lambda: (
                 self.scan_btn.config(state='normal'),
-                self._filter_only(),
                 self.manager.auto_download_completed(log, self.delay_minutes.get()) if auto else None,
                 self._refresh_summary(),
                 self._refresh_sites(),
@@ -299,50 +397,8 @@ class FTPSiteGUI:
     def _filter_only(self):
         if not self.full_log: return
         for i in self.tree.get_children(): self.tree.delete(i)
-        items = []
-        now_utc = datetime.now(timezone.utc)
-
         for site_items in self.full_log.log.values():
-            for item in site_items:
-                if self.show_issues.get() and item['status'] in ['ok', 'scheduled'] and not item.get('is_current_utc'):
-                    continue
-                if self.filter_site.get() != "All Stations" and item['site'] != self.filter_site.get():
-                    continue
-
-                if 'file_dt' not in item:
-                    try:
-                        if ' ' in item['date']:
-                            item['file_dt'] = datetime.strptime(item['date'], "%Y-%m-%d %H:%M").replace(tzinfo=timezone.utc)
-                        else:
-                            item['file_dt'] = datetime.strptime(item['date'], "%Y-%m-%d").replace(tzinfo=timezone.utc)
-                    except:
-                        item['file_dt'] = None
-
-                is_current_utc = ' ' in item['date'] and item['date'].split()[0] == now_utc.strftime("%Y-%m-%d") and item['date'].split()[1][:2] == now_utc.strftime("%H")
-                if is_current_utc and item['remote'] == 'yes':
-                    item['is_current_utc'] = True
-                    item['status'] = 'new'
-
-                items.append(item)
-
-        for item in sorted(items, key=lambda x: (extract_station_name(x['file']), x['site'], x['date'], x['file'])):
-            tag = ('current_growing' if item.get('is_current_utc') else
-                   'missing_local' if item['status'] == 'missing locally' else
-                   'missing_remote' if item['status'] == 'missing remotely' else
-                   'mismatch' if item['status'] == 'size mismatch' else 'scheduled')
-            
-            log_name = item['site']
-            station_name = getattr(item['site_obj'], 'station_code', extract_station_name(item['file']))
-            local_size_str = format_size(item['local_size']) if item['local'] == 'yes' else "—"
-            remote_size_str = format_size(item['remote_size']) if item['remote'] == 'yes' else "—"
-
-            self.tree.insert('', 'end', values=(
-                log_name, station_name, item['date'], item['file'],
-                item['local'], local_size_str,
-                item['remote'], remote_size_str,
-                item['status'],
-                'CURRENT (growing)' if item.get('is_current_utc') else 'Future' if item['future'] else 'Past'
-            ), tags=(tag,))
+            self._insert_site_items(site_items)
 
     def _download(self):
         if not self.full_log: return
@@ -372,15 +428,42 @@ class FTPSiteGUI:
 
     def _toggle_scheduler(self):
         if not self.scheduler_running:
+            # Write control file and launch service process
+            delay = self.delay_minutes.get()
+            days = self.days_var.get()
+            write_control(True, delay, days)
+
+            newly_launched = False
+            if not is_service_running():
+                # Launch headless process detached from this GUI
+                python = sys.executable
+                script = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'main.py')
+                flags = (subprocess.CREATE_NO_WINDOW |
+                         subprocess.DETACHED_PROCESS |
+                         subprocess.CREATE_NEW_PROCESS_GROUP |
+                         subprocess.CREATE_BREAKAWAY_FROM_JOB)
+                try:
+                    subprocess.Popen([python, script, '--headless'],
+                                     creationflags=flags, close_fds=True)
+                except OSError:
+                    # CREATE_BREAKAWAY_FROM_JOB denied — fall back without it
+                    subprocess.Popen([python, script, '--headless'],
+                                     creationflags=flags & ~subprocess.CREATE_BREAKAWAY_FROM_JOB,
+                                     close_fds=True)
+                logger.info("Launched scheduler service process")
+                newly_launched = True
+
             self.scheduler_running = True
             self.scheduler_btn.config(text="STOP SCHEDULER")
             self.led.delete("dot")
             self.led.create_oval(4, 4, 14, 14, fill="lime", outline="green", width=3, tags="dot")
             self._schedule_next_run()
-            self.scheduler_thread = threading.Thread(target=self._scheduler_loop, daemon=True)
+            self.scheduler_thread = threading.Thread(
+                target=self._scheduler_loop, args=(newly_launched,), daemon=True)
             self.scheduler_thread.start()
-            self._scan_and_download(auto=True)
         else:
+            # Signal service to stop via control file
+            write_control(False)
             self.scheduler_running = False
             self.scheduler_btn.config(text="START SCHEDULER")
             self.led.delete("dot")
@@ -390,23 +473,68 @@ class FTPSiteGUI:
     def _schedule_next_run(self):
         now = datetime.now()
         delay = self.delay_minutes.get()
-        next_hour = (now + timedelta(hours=1)).replace(minute=delay, second=0, microsecond=0)
-        if now.hour == 23 and delay > 0:
-            next_hour += timedelta(days=1)
-        self.next_run_time = next_hour
+        candidate = now.replace(minute=delay, second=0, microsecond=0)
+        if candidate <= now:
+            candidate += timedelta(hours=1)
+        self.next_run_time = candidate
         remaining = int((self.next_run_time - now).total_seconds())
         self.scheduler_var.set(f"Next run: {self.next_run_time.strftime('%H:%M')} (in {self._format_countdown(remaining)})")
 
-    def _scheduler_loop(self):
+    def _scheduler_loop(self, newly_launched=False):
+        """Monitor the external service process and update the GUI countdown."""
+        # When we just launched the service, give it up to 5 s to write its PID file
+        # before treating a missing PID as a crash.
+        startup_deadline = time.time() + 5 if newly_launched else 0
+
         while self.scheduler_running:
+            # Check if service is still alive
+            if not is_service_running():
+                ctrl = read_control()
+                if ctrl and ctrl.get('running', False):
+                    if time.time() < startup_deadline:
+                        # Still within startup grace period – wait and retry
+                        time.sleep(0.5)
+                        continue
+                    # Service died unexpectedly, restart it
+                    logger.warning("Scheduler service not running, restarting...")
+                    python = sys.executable
+                    script = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'main.py')
+                    flags = (subprocess.CREATE_NO_WINDOW |
+                             subprocess.DETACHED_PROCESS |
+                             subprocess.CREATE_NEW_PROCESS_GROUP |
+                             subprocess.CREATE_BREAKAWAY_FROM_JOB)
+                    try:
+                        subprocess.Popen([python, script, '--headless'],
+                                         creationflags=flags, close_fds=True)
+                    except OSError:
+                        subprocess.Popen([python, script, '--headless'],
+                                         creationflags=flags & ~subprocess.CREATE_BREAKAWAY_FROM_JOB,
+                                         close_fds=True)
+                    startup_deadline = time.time() + 5  # grace period for the restarted process
+                else:
+                    # Service stopped itself
+                    self.root.after(0, self._on_service_stopped)
+                    return
+
+            # Update control file with current GUI settings
+            write_control(True, self.delay_minutes.get(), self.days_var.get())
+
             now = datetime.now()
-            if now >= self.next_run_time:
-                self.root.after(0, lambda: self._scan_and_download(auto=True))
-                self._schedule_next_run()
+            self._schedule_next_run()
             remaining = int((self.next_run_time - now).total_seconds())
             if remaining > 0:
-                self.root.after(0, lambda r=remaining: self.scheduler_var.set(f"Next run: {self.next_run_time.strftime('%H:%M')} (in {self._format_countdown(r)})"))
-            time.sleep(1)
+                svc_label = "SERVICE RUNNING"
+                self.root.after(0, lambda r=remaining: self.scheduler_var.set(
+                    f"{svc_label} | Next run: {self.next_run_time.strftime('%H:%M')} (in {self._format_countdown(r)})"))
+            time.sleep(5)
+
+    def _on_service_stopped(self):
+        """Called when the external service stops."""
+        self.scheduler_running = False
+        self.scheduler_btn.config(text="START SCHEDULER")
+        self.led.delete("dot")
+        self.led.create_oval(4, 4, 14, 14, fill="red", tags="dot")
+        self.scheduler_var.set("Service stopped")
 
     def _format_countdown(self, seconds):
         m, s = divmod(seconds, 60)
@@ -423,60 +551,53 @@ class FTPSiteGUI:
                     self._refresh_summary()
 
     def _refresh_sites(self):
-        for item in self.tree_sites.get_children():
-            self.tree_sites.delete(item)
+        def build_tree():
+            networks = {}
+            for site in self.manager.sites:
+                net = site.network or "Unknown"
+                if net not in networks:
+                    networks[net] = {}
+                station = site.station_code or site.name
+                rate_key = f"{site.rate} {'[ExtClk]' if site.external_clock else ''}".strip()
+                key = f"{station} | {site.name} | {rate_key}"
+                if key not in networks[net]:
+                    networks[net][key] = []
+                networks[net][key].append(site)
+            return networks
 
-        networks = {}
-        for site in self.manager.sites:
-            net = site.network or "Unknown"
-            if net not in networks:
-                networks[net] = {}
-            try:
-                for item in self.manager.scanner.scan_site(site, 1):
-                    if item['local'] == 'yes' or item['remote'] == 'yes':
-                        station = getattr(site, 'station_code', extract_station_name(item['file']))
-                        rate_key = f"{site.rate} {'[ExtClk]' if site.external_clock else ''}".strip()
-                        key = f"{station} | {site.name} | {rate_key}"
-                        if key not in networks[net]:
-                            networks[net][key] = []
-                        networks[net][key].append(site)
-                        break
-            except: pass
+        def update_ui(networks):
+            for item in self.tree_sites.get_children():
+                self.tree_sites.delete(item)
 
-        for net, stations in sorted(networks.items()):
-            net_id = self.tree_sites.insert('', 'end', text=f" {net.upper()}", open=True)
-            for station_key, sites in sorted(stations.items()):
-                parts = station_key.split(' | ')
-                station_name = parts[0]
-                log_name = parts[1]
-                rate = parts[2]
-                station_id = self.tree_sites.insert(net_id, 'end', text=f"  {station_name}", open=True)
-                self.tree_sites.insert(station_id, 'end', text=f"   {log_name} - {rate}", values=(log_name,))
+            for net, stations in sorted(networks.items()):
+                net_id = self.tree_sites.insert('', 'end', text=f" {net.upper()}", open=True)
+                for station_key, sites in sorted(stations.items()):
+                    parts = station_key.split(' | ')
+                    station_name = parts[0]
+                    log_name = parts[1]
+                    rate = parts[2]
+                    station_id = self.tree_sites.insert(net_id, 'end', text=f"  {station_name}", open=True)
+                    self.tree_sites.insert(station_id, 'end', text=f"   {log_name} - {rate}", values=(log_name,))
 
-        station_list = ["All Stations"] + sorted([s.name for s in self.manager.sites])
-        self.summary_combo['values'] = station_list
-        if self.summary_filter.get() not in station_list:
-            self.summary_filter.set("All Stations")
-        self.combo['values'] = station_list
-        if self.manager.sites:
-            self.combo.current(0)
+            station_list = ["All Stations"] + sorted([s.name for s in self.manager.sites])
+            self.summary_combo['values'] = station_list
+            if self.summary_filter.get() not in station_list:
+                self.summary_filter.set("All Stations")
+            self.combo['values'] = station_list
+            if self.manager.sites:
+                self.combo.current(0)
+
+        networks = build_tree()
+        update_ui(networks)
 
     def _edit_dialog(self, site=None, idx=None):
         win = tk.Toplevel(self.root)
         win.title("Add Station" if not site else "Edit Station")
         win.geometry("720x1100")
 
-        detected_station = ""
-        if site:
-            try:
-                sample = self.manager.scanner.scan_site(site, 1)
-                if sample and (sample[0]['local'] == 'yes' or sample[0]['remote'] == 'yes'):
-                    detected_station = extract_station_name(sample[0]['file'])
-            except: pass
-
         fields = [
             ('network', 'Network (e.g. NOA)'),
-            ('station_code', f'Station Name (4-letter) → Auto: {detected_station}' if detected_station else 'Station Name (4-letter)'),
+            ('station_code', 'Station Name (4-letter)'),
             ('name', 'Log Name (e.g. NOA1)'),
             ('rate', 'Rate (1s/30s)'),
             ('format', 'Format'),
@@ -499,13 +620,23 @@ class FTPSiteGUI:
                 e = ttk.Entry(win, width=55)
                 if site and key in site.__dict__:
                     e.insert(0, getattr(site, key, ''))
-                elif key == 'station_code' and detected_station and not getattr(site, 'station_code', ''):
-                    e.insert(0, detected_station)
                 e.grid(row=i, column=1, padx=20, pady=8)
                 ents[key] = e
 
         ttk.Checkbutton(win, text="External Clock", variable=ext_clk).grid(row=len(fields), column=0, columnspan=2, pady=10)
         ttk.Checkbutton(win, text="Use letter hour (a-x)", variable=letter).grid(row=len(fields)+1, column=0, columnspan=2, pady=10)
+
+        # Pattern reference
+        ref_frame = ttk.LabelFrame(win, text=" Pattern Reference (strftime codes) ")
+        ref_frame.grid(row=len(fields)+2, column=0, columnspan=2, padx=20, pady=10, sticky='ew')
+        ref_text = (
+            "%Y = 4-digit year (2026)    %y = 2-digit year (26)    %m = month (03)    %d = day (20)\n"
+            "%H = hour 00-23             %M = minute 00-59         %j = day of year (079)\n"
+            "Path and Pattern both support these codes.  Example path: /%Y%m/%d\n"
+            "Example pattern: STATION%m%d%H.tps   (with letter-hour: %H replaced by a-x)"
+        )
+        ttk.Label(ref_frame, text=ref_text, font=('Consolas', 9), foreground='#555555',
+                  justify='left').pack(padx=10, pady=8)
 
         def save():
             data = {k: (v.get() if isinstance(v, tk.StringVar) else v.get().strip()) for k,v in ents.items()}
@@ -520,7 +651,7 @@ class FTPSiteGUI:
                 win.destroy()
             except Exception as e:
                 messagebox.showerror("Error", str(e))
-        ttk.Button(win, text="Save Station", command=save).grid(row=len(fields)+2, column=0, columnspan=2, pady=20)
+        ttk.Button(win, text="Save Station", command=save).grid(row=len(fields)+3, column=0, columnspan=2, pady=20)
 
     def _add_site(self): self._edit_dialog()
     def _edit_site(self):
@@ -551,6 +682,22 @@ class FTPSiteGUI:
     def _refresh_table(self):
         self.notebook.select(0)
         self._scan_and_download(auto=False)
+
+    def _update_status_display(self, *args):
+        text = self.status_var.get()
+        self.status_text.config(state='normal')
+        self.status_text.delete(1.0, tk.END)
+        self.status_text.insert(tk.END, text)
+        self.status_text.config(state='disabled')
+
+    def _on_close(self):
+        if self.scheduler_running and is_service_running():
+            messagebox.showinfo(
+                "Scheduler Running",
+                "The scheduler service will keep running in the background.\n"
+                "Reopen the app to monitor or stop it."
+            )
+        self.root.destroy()
 
     def run(self):
         self.root.mainloop()

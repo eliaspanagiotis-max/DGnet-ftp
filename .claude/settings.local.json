@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python main.py)",
+      "Bash(tasklist /FI \"PID eq 136724\" /NH)",
+      "Bash(start pythonw:*)",
+      "Bash(tasklist /FI \"PID eq 122816\" /NH)",
+      "Bash(python -c \"from scheduler_control import is_service_running, read_control; print\\(''running:'', is_service_running\\(\\)\\); print\\(''ctrl:'', read_control\\(\\)\\)\")",
+      "Bash(python -c \"import os; pid=122816;:*)",
+      "Bash(python -c \"import json; data=json.load\\(open\\(''c:/Users/pelias/claude/github/DGnet-ftp/sites_config.json''\\)\\); sites=[s for s in data if ''UPAG'' in s.get\\(''name'',''''\\).upper\\(\\) or ''UPAG'' in s.get\\(''station_code'',''''\\).upper\\(\\)]; [print\\(json.dumps\\({k:v for k,v in s.items\\(\\) if k!=''password''},indent=2\\)\\) for s in sites]\")",
+      "Bash(python -c \":*)"
+    ]
+  }
+}
