@@ -23,6 +23,8 @@ class FTPSiteManager:
                   file_cb: Callable[[str, str], None] = None) -> MissingFilesLog:
         log = MissingFilesLog()
         for site in self.sites:
+            if not getattr(site, 'enabled', True):
+                continue
             if progress_cb:
                 progress_cb(f"Scanning {site.name} [{site.network} {site.rate}]...")
             items = self.scanner.scan_site(site, days_back, file_cb=file_cb)
@@ -36,6 +38,8 @@ class FTPSiteManager:
     def scan_all_remote(self, progress_cb=None, site_cb=None, file_cb=None) -> MissingFilesLog:
         log = MissingFilesLog()
         for site in self.sites:
+            if not getattr(site, 'enabled', True):
+                continue
             if progress_cb:
                 progress_cb(f"Scanning all remote files for {site.name}...")
             items = self.scanner.scan_site_all_remote(site, file_cb=file_cb)

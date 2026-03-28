@@ -93,7 +93,9 @@ class FTPSiteGUI:
         ttk.Label(left_frame, text="Greek GNSS Network - Grouped View", font=('Arial', 16, 'bold')).pack(pady=15)
         self.tree_sites = ttk.Treeview(left_frame, show='tree', selectmode='extended')
         self.tree_sites.pack(fill='both', expand=True, padx=20, pady=10)
+        self.tree_sites.tag_configure('disabled', foreground='#aaaaaa')
         self.tree_sites.bind('<<TreeviewSelect>>', self._on_tree_select)
+        self.tree_sites.bind('<ButtonRelease-1>', self._on_tree_click)
         
         btns = ttk.Frame(left_frame)
         btns.pack(pady=8)
@@ -1028,6 +1030,25 @@ class FTPSiteGUI:
                 if self.summary_filter.get() == self.selected_log_name:
                     self._refresh_summary()
 
+    def _on_tree_click(self, event):
+        iid = self.tree_sites.identify_row(event.y)
+        if not iid:
+            return
+        values = self.tree_sites.item(iid, 'values')
+        if not values:
+            return  # network or station group node — no checkbox
+        site_name = values[0]
+        site = next((s for s in self.manager.sites if s.name == site_name), None)
+        if site is None:
+            return
+        site.enabled = not getattr(site, 'enabled', True)
+        self.manager._save()
+        rate_key = f"{site.rate} {'[ExtClk]' if site.external_clock else ''}".strip()
+        mark = '☑' if site.enabled else '☐'
+        self.tree_sites.item(iid,
+            text=f"   {mark} {site.name} - {rate_key}",
+            tags=() if site.enabled else ('disabled',))
+
     def _refresh_sites(self):
         def build_tree():
             networks = {}
@@ -1047,7 +1068,12 @@ class FTPSiteGUI:
                     station_id = self.tree_sites.insert(net_id, 'end', text=f"  {station_name}", open=True)
                     for site in sites:
                         rate_key = f"{site.rate} {'[ExtClk]' if site.external_clock else ''}".strip()
-                        self.tree_sites.insert(station_id, 'end', text=f"   {site.name} - {rate_key}", values=(site.name,))
+                        enabled = getattr(site, 'enabled', True)
+                        mark = '☑' if enabled else '☐'
+                        tag = () if enabled else ('disabled',)
+                        self.tree_sites.insert(station_id, 'end',
+                            text=f"   {mark} {site.name} - {rate_key}",
+                            values=(site.name,), tags=tag)
 
             station_list = ["All Stations"] + sorted([s.name for s in self.manager.sites])
             self.summary_combo['values'] = station_list
