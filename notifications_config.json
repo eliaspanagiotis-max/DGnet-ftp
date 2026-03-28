@@ -1,0 +1,27 @@
+{
+  "enabled": true,
+  "recipients": [
+    {
+      "email": "pelias@upatras.gr",
+      "on_start": true,
+      "on_stop": true,
+      "on_inactive": true,
+      "repeat_minutes": 30,
+      "on_download": true,
+      "on_last_file": true,
+      "on_mount_alert": true,
+      "on_ping_alert": true
+    },
+    {
+      "email": "eliaspanagiotis@gmail.com",
+      "on_start": false,
+      "on_stop": false,
+      "on_inactive": true,
+      "repeat_minutes": 30,
+      "on_download": true,
+      "on_last_file": true,
+      "on_mount_alert": false,
+      "on_ping_alert": true
+    }
+  ]
+}

@@ -3,14 +3,16 @@ import atexit
 import logging
 import os
 import signal
-import sys
 import time
 import traceback
 from datetime import datetime, timedelta
 
 from config import setup_logging
 from manager import FTPSiteManager
-from scheduler_control import CONTROL_FILE, PID_FILE, LOG_FILE, read_control, write_control, is_service_running
+from notifier import (notify_scheduler_started, notify_scheduler_stopped,
+                      notify_scheduler_inactive, notify_scheduler_crashed,
+                      notify_last_file_status)
+from scheduler_control import PID_FILE, LOG_FILE, read_control, write_control
 
 logger = logging.getLogger(__name__)
 
@@ -29,7 +31,7 @@ def run_headless(manager):
     with open(PID_FILE, 'w') as f:
         f.write(str(os.getpid()))
 
-    def stop(sig, frame):
+    def stop(sig, _):
         global _stop_reason
         _stop_reason = f"signal {sig}"
         logger.info("Received signal %s, stopping scheduler service...", sig)
@@ -37,16 +39,20 @@ def run_headless(manager):
 
     signal.signal(signal.SIGINT, stop)
     signal.signal(signal.SIGTERM, stop)
+    if hasattr(signal, 'SIGHUP'):   # Ignore terminal hangup on Linux/Mac
+        signal.signal(signal.SIGHUP, signal.SIG_IGN)
     if hasattr(signal, 'SIGBREAK'):  # Windows Ctrl+Break / task-manager kill
         signal.signal(signal.SIGBREAK, stop)
 
     logger.info("Scheduler service started (PID %d)", os.getpid())
+    notify_scheduler_started()
 
     try:
         while True:
             ctrl = read_control()
             if not ctrl or not ctrl.get('running', False):
-                _stop_reason = "control file set running=false"
+                if 'signal' not in _stop_reason:
+                    _stop_reason = "control file set running=false"
                 logger.info("Control file says stop. Exiting.")
                 break
 
@@ -65,7 +71,8 @@ def run_headless(manager):
             while datetime.now() < next_run:
                 ctrl = read_control()
                 if not ctrl or not ctrl.get('running', False):
-                    _stop_reason = "control file set running=false (during wait)"
+                    if 'signal' not in _stop_reason:
+                        _stop_reason = "control file set running=false (during wait)"
                     logger.info("Control file says stop. Exiting.")
                     return
                 # Re-read delay in case GUI changed it
@@ -88,6 +95,9 @@ def run_headless(manager):
                     file_cb=lambda site, f: logger.debug("[%s] %s", site, f),
                 )
                 manager.auto_download_completed(log, delay_minutes)
+                last_statuses = manager.get_last_file_statuses(log, delay_minutes)
+                if last_statuses:
+                    notify_last_file_status(last_statuses)
 
                 total = sum(len(items) for items in log.log.values())
                 missing = sum(
@@ -102,7 +112,9 @@ def run_headless(manager):
 
     except Exception:
         _stop_reason = "unhandled exception (see ERROR above)"
-        logger.critical("Scheduler crashed with unhandled exception:\n%s", traceback.format_exc())
+        tb = traceback.format_exc()
+        logger.critical("Scheduler crashed with unhandled exception:\n%s", tb)
+        notify_scheduler_crashed(tb)
         raise
     finally:
         # Cleanup PID file
@@ -111,6 +123,10 @@ def run_headless(manager):
         except OSError:
             pass
         logger.info("Scheduler service stopped. Reason: %s", _stop_reason)
+        if 'signal' in _stop_reason or 'crashed' in _stop_reason or 'unknown' in _stop_reason:
+            notify_scheduler_inactive(_stop_reason)
+        else:
+            notify_scheduler_stopped(_stop_reason)
 
 
 if __name__ == "__main__":

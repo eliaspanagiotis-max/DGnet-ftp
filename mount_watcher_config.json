@@ -1,0 +1,10 @@
+{
+  "mountpoints": [
+    {
+      "path": "/mnt/GNSS",
+      "name": "GNSS"
+    }
+  ],
+  "interval": 10,
+  "ping_enabled": true
+}

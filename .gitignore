@@ -1,9 +1,11 @@
 # Local config with credentials - never commit
 sites_config.json
+smtp_config.json
 
 # Runtime files
 scheduler.log
 scheduler.pid
+watchdog.pid
 scheduler_control.json
 downloads/
 

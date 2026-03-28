@@ -64,10 +64,12 @@ class FTPSiteManager:
                     except ValueError:
                         logger.debug("Could not parse date '%s', skipping", item['date'])
         if items:
-            self.download_missing(items, lambda msg: None)
+            self.download_missing(items, lambda msg: logger.info(msg))
 
     def download_missing(self, items, progress_cb=None):
+        from notifier import notify_files_downloaded
         total = len(items)
+        downloaded = []
         for i, item in enumerate(items):
             if progress_cb:
                 progress_cb(f"Downloading {item['file']} ({i+1}/{total})")
@@ -77,12 +79,52 @@ class FTPSiteManager:
                 site = SiteConfig.from_dict(site.to_dict())
                 site.path = item['remote_path']
             conn = ConnectorFactory.get(site.protocol)
+            os.makedirs(os.path.dirname(item['local_path']), exist_ok=True)
             success = conn.download(site, item['file'], item['local_path'])
             if success and os.path.exists(item['local_path']):
                 item['local_size'] = os.path.getsize(item['local_path'])
                 item['status'] = 'ok'
                 item['local'] = 'yes'
                 item['size_ok'] = 'yes'
+                downloaded.append(f"[{item['site']}] {item['file']}")
+        if downloaded:
+            notify_files_downloaded(downloaded)
+
+    def get_last_file_statuses(self, log: MissingFilesLog, delay_minutes: int = 0):
+        """Return the most recently expected completed file per site with its download status.
+
+        Files within the scheduler delay window are marked 'pending' rather than missing,
+        because the scheduler hasn't had time to download them yet.
+        """
+        now = datetime.now(timezone.utc)
+        delay_cutoff = now - timedelta(minutes=delay_minutes)
+        results = []
+        for site_name, items in log.log.items():
+            completed = [it for it in items
+                         if not it.get('future') and not it.get('is_current_utc')]
+            if not completed:
+                continue
+            last = max(completed, key=lambda it: it['date'])
+            # Resolve the file's expected datetime for the delay check
+            last_dt = last.get('available_dt')
+            if not last_dt:
+                try:
+                    date_str = last['date']
+                    fmt = "%Y-%m-%d %H:%M" if ' ' in date_str else "%Y-%m-%d"
+                    last_dt = datetime.strptime(date_str, fmt).replace(tzinfo=timezone.utc)
+                except (ValueError, KeyError):
+                    last_dt = None
+            pending = last_dt is not None and last_dt >= delay_cutoff
+            status = last['status']
+            if status in ('missing locally', 'missing remotely') and pending:
+                status = 'pending'
+            results.append({
+                'site': site_name,
+                'file': last['file'],
+                'date': last['date'],
+                'status': status,
+            })
+        return results
 
     def add_site(self, **kw):
         self.sites.append(SiteConfig(**kw))
