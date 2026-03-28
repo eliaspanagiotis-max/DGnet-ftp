@@ -35,7 +35,7 @@ class FTPSiteGUI:
     def __init__(self, manager):
         self.manager = manager
         self.root = tk.Tk()
-        self.root.title("DGnet FTP Monitor - GREEK NATIONAL v9.999.9.7 - OFFICIAL FINAL - 10 Nov 2025 03:09 PM EET")
+        self.root.title("DGnet FTP Monitor")
         self.root.geometry("1400x900")
         self.root.minsize(900, 600)
         self.days_var = tk.IntVar(value=1)
@@ -91,9 +91,16 @@ class FTPSiteGUI:
         paned.add(left_frame, weight=1)
 
         ttk.Label(left_frame, text="Greek GNSS Network - Grouped View", font=('Arial', 16, 'bold')).pack(pady=15)
-        self.tree_sites = ttk.Treeview(left_frame, show='tree', selectmode='extended')
+        self.tree_sites = ttk.Treeview(left_frame, columns=('name', 'chk'), show='tree headings', selectmode='extended')
+        self.tree_sites.column('#0', stretch=True, minwidth=80)
+        self.tree_sites.column('name', width=0, stretch=False, minwidth=0)
+        self.tree_sites.column('chk', width=40, stretch=False, anchor='center', minwidth=40)
+        self.tree_sites.heading('#0', text='')
+        self.tree_sites.heading('name', text='')
+        self.tree_sites.heading('chk', text='')
         self.tree_sites.pack(fill='both', expand=True, padx=20, pady=10)
-        self.tree_sites.tag_configure('disabled', foreground='#aaaaaa')
+        self.tree_sites.tag_configure('leaf_enabled', font=('Segoe UI', 11))
+        self.tree_sites.tag_configure('leaf_disabled', foreground='#aaaaaa', font=('Segoe UI', 11))
         self.tree_sites.bind('<<TreeviewSelect>>', self._on_tree_select)
         self.tree_sites.bind('<ButtonRelease-1>', self._on_tree_click)
         
@@ -1032,10 +1039,11 @@ class FTPSiteGUI:
 
     def _on_tree_click(self, event):
         iid = self.tree_sites.identify_row(event.y)
-        if not iid:
-            return
+        col = self.tree_sites.identify_column(event.x)
+        if not iid or col != '#2':
+            return  # only toggle when clicking the checkbox column
         values = self.tree_sites.item(iid, 'values')
-        if not values:
+        if not values or not values[0]:
             return  # network or station group node — no checkbox
         site_name = values[0]
         site = next((s for s in self.manager.sites if s.name == site_name), None)
@@ -1043,11 +1051,9 @@ class FTPSiteGUI:
             return
         site.enabled = not getattr(site, 'enabled', True)
         self.manager._save()
-        rate_key = f"{site.rate} {'[ExtClk]' if site.external_clock else ''}".strip()
         mark = '☑' if site.enabled else '☐'
-        self.tree_sites.item(iid,
-            text=f"   {mark} {site.name} - {rate_key}",
-            tags=() if site.enabled else ('disabled',))
+        self.tree_sites.set(iid, 'chk', mark)
+        self.tree_sites.item(iid, tags=('leaf_enabled',) if site.enabled else ('leaf_disabled',))
 
     def _refresh_sites(self):
         def build_tree():
@@ -1070,10 +1076,10 @@ class FTPSiteGUI:
                         rate_key = f"{site.rate} {'[ExtClk]' if site.external_clock else ''}".strip()
                         enabled = getattr(site, 'enabled', True)
                         mark = '☑' if enabled else '☐'
-                        tag = () if enabled else ('disabled',)
+                        tag = ('leaf_enabled',) if enabled else ('leaf_disabled',)
                         self.tree_sites.insert(station_id, 'end',
-                            text=f"   {mark} {site.name} - {rate_key}",
-                            values=(site.name,), tags=tag)
+                            text=f"  {site.name} - {rate_key}",
+                            values=(site.name, mark), tags=tag)
 
             station_list = ["All Stations"] + sorted([s.name for s in self.manager.sites])
             self.summary_combo['values'] = station_list
@@ -1123,10 +1129,12 @@ class FTPSiteGUI:
         ttk.Checkbutton(win, text="Use letter hour (a-x)", variable=letter).grid(row=len(fields)+1, column=0, columnspan=2, pady=10)
         ping_check = tk.BooleanVar(value=getattr(site, 'ping_check', False) if site else False)
         ttk.Checkbutton(win, text="Enable ping check", variable=ping_check).grid(row=len(fields)+2, column=0, columnspan=2, pady=10)
+        enabled_var = tk.BooleanVar(value=getattr(site, 'enabled', True) if site else True)
+        ttk.Checkbutton(win, text="Include in scheduler (enabled)", variable=enabled_var).grid(row=len(fields)+3, column=0, columnspan=2, pady=10)
 
         # Pattern reference
         ref_frame = ttk.LabelFrame(win, text=" Pattern Reference (strftime codes) ")
-        ref_frame.grid(row=len(fields)+3, column=0, columnspan=2, padx=20, pady=10, sticky='ew')
+        ref_frame.grid(row=len(fields)+4, column=0, columnspan=2, padx=20, pady=10, sticky='ew')
         ref_text = (
             "%Y = 4-digit year (2026)    %y = 2-digit year (26)    %m = month (03)    %d = day (20)\n"
             "%H = hour 00-23             %M = minute 00-59         %j = day of year (079)\n"
@@ -1141,6 +1149,7 @@ class FTPSiteGUI:
             data['external_clock'] = ext_clk.get()
             data['use_letter_hour'] = letter.get()
             data['ping_check'] = ping_check.get()
+            data['enabled'] = enabled_var.get()
             try:
                 if site:
                     self.manager.edit_site(idx, **data)
@@ -1152,7 +1161,7 @@ class FTPSiteGUI:
                 win.destroy()
             except Exception as e:
                 messagebox.showerror("Error", str(e))
-        ttk.Button(win, text="Save Station", command=save).grid(row=len(fields)+4, column=0, columnspan=2, pady=20)
+        ttk.Button(win, text="Save Station", command=save).grid(row=len(fields)+5, column=0, columnspan=2, pady=20)
 
     def _add_site(self): self._edit_dialog()
     def _edit_site(self):
